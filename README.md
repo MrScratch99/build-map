@@ -17,7 +17,7 @@ It renders through [archify](https://github.com/tt-a1i/archify) (MIT), which lay
   git clone https://github.com/tt-a1i/archify ~/.claude/skills/archify
   node ~/.claude/skills/archify/bin/archify.mjs doctor
   ```
-  Somewhere else? Set `ARCHIFY=/path/to/archify/bin/archify.mjs`.
+  build-map finds it in `~/.claude/skills/` or in a Claude Code plugin folder on its own. Anywhere else: set `ARCHIFY=/path/to/archify/bin/archify.mjs`.
 
 ## Try it
 

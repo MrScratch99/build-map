@@ -27,8 +27,22 @@ waiting than running, and names the waiting ones: work that could run is sitting
 """
 import json, os, subprocess, sys, tempfile, time
 
-ARCHIFY = os.path.expanduser(os.environ.get(
-    "ARCHIFY", "~/.claude/skills/archify/bin/archify.mjs"))
+def find_archify():
+    """$ARCHIFY if set, else the usual skill folder, else any archify that
+    Claude Code installed as a plugin."""
+    if os.environ.get("ARCHIFY"):
+        return os.path.expanduser(os.environ["ARCHIFY"])
+    home = os.path.expanduser("~/.claude")
+    first = os.path.join(home, "skills/archify/bin/archify.mjs")
+    if os.path.exists(first):
+        return first
+    for root, dirs, files in os.walk(os.path.join(home, "plugins")):
+        if "archify.mjs" in files and root.endswith(os.path.join("archify", "bin")):
+            return os.path.join(root, "archify.mjs")
+    return first
+
+
+ARCHIFY = find_archify()
 
 # archify colours nodes by component type; the legend labels say what each
 # colour means here, so the mapping stays truthful to the reader.
@@ -115,6 +129,8 @@ def render(spec, status, out_dir):
     if not os.path.exists(live):
         open(live, "w").write(LIVE_HTML)
 
+    if not os.path.exists(ARCHIFY):
+        die("archify not found. Set ARCHIFY=/path/to/archify/bin/archify.mjs")
     out = os.path.join(out_dir, "live-diagram.html")
     for attempt in (1, 2):
         with tempfile.NamedTemporaryFile("w", suffix=".workflow.json", dir=out_dir, delete=False) as tmp:
