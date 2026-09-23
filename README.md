@@ -1,6 +1,6 @@
 # build-map
 
-A live picture of a build while it runs. Each part of the build is a box, arrows show what waits on what, and the colours change as work moves: done, building now, waiting, blocked, needs you. Open one page in a browser and it redraws itself every 15 seconds.
+A live picture of a build while it runs. Each part of the build is a box, arrows show what waits on what, and the colours change as work moves: done, building now, waiting, blocked, needs you. Open one page in a browser and it redraws itself every 15 seconds. A panel beside the picture says, in plain words, what the AI is working on right now and what just changed.
 
 ![build-map](screenshot.png)
 
@@ -49,7 +49,14 @@ Open `demo-out/live.html` while it runs. Five parts go from waiting to done over
 ./build-map set ./map e2e=human:"approve deploy"
 ```
 
-States: `waiting`, `running`, `done`, `blocked`, `human`. Text after the colon shows under the box name.
+States: `waiting`, `running`, `done`, `blocked`, `human`. Text after the colon shows under the box name (short, about 26 characters).
+
+**Say what it's doing.** `--say` puts a full sentence in the "Now building" panel next to the picture. The panel lists every box that is running, blocked or waiting on you, plus the last six changes.
+
+```bash
+./build-map set ./map api=running:"routes" --say "api: writing the login and signup routes"
+./build-map set ./map --say "api: routes done, writing their tests"   # new sentence, same state
+```
 
 **3. Watch it.** Open `./map/live.html`.
 
@@ -63,7 +70,7 @@ When more parts are waiting than running, the subtitle says so and names them. T
 
 Put this in your orchestrator's instructions (or CLAUDE.md):
 
-> Before dispatching anything, run `build-map init` with every node and its dependencies. After every state change on the board, run `build-map set` in the same step. A node is `running` only while an agent is actually working on it.
+> Before dispatching anything, run `build-map init` with every node and its dependencies. After every state change on the board, run `build-map set` in the same step, with `--say "<id>: <one sentence on what the agent is doing>"` for every node that starts running or gets blocked. A node is `running` only while an agent is actually working on it.
 
 That last rule matters: a map that shows six boxes building while one agent works is worse than no map.
 

@@ -12,6 +12,8 @@
       Sets those nodes' states, stamps the time, and re-renders. One command,
       so the picture can never drift from the board. States: waiting, running,
       done, blocked, human. Unlisted nodes stay as they are (waiting at first).
+      Add --say "<id>: <sentence>" for the "Now building" panel next to the
+      picture: what the agent is doing, in more words than fit under a box.
 
   build-map <map.json> <status.json> <dir>
       The explicit form: render that map with that status into that directory,
@@ -19,7 +21,7 @@
       this when the plan carries docs/build-map.json. Pass <dir>/status.json
       as <status.json>, because that is the file "set" writes.
 
-Every form writes <dir>/live-diagram.html and, once, <dir>/live.html. Open
+Every form writes <dir>/live-diagram.html, <dir>/now.js and <dir>/live.html. Open
 live.html in Chrome: it reloads itself every 15 s.
 
 Every render warns, on stdout and as the picture's subtitle, when more nodes are
@@ -58,15 +60,60 @@ LIVE_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Build map (live)</title>
 <style>
   html,body{margin:0;height:100%;background:#05070d;color:#9aa4b2;font:12px ui-monospace,Menlo,monospace}
-  #bar{position:fixed;right:12px;bottom:10px;z-index:2;opacity:.8}
-  iframe{border:0;width:100%;height:100%;display:block}
+  #wrap{display:flex;height:100%}
+  iframe{border:0;flex:1;height:100%;display:block;min-width:0}
+  #panel{width:300px;flex:none;padding:18px 16px;box-sizing:border-box;overflow-y:auto;border-left:1px solid #1c2230}
+  h2{margin:0 0 10px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#e5e7eb}
+  h2.later{margin-top:22px}
+  .item{border-left:3px solid;padding:6px 0 6px 10px;margin-bottom:10px}
+  .name{color:#e5e7eb;font-weight:bold}
+  .text{margin-top:3px;line-height:1.45;color:#b6c0cc}
+  .time{color:#5b6574}
+  .empty{color:#5b6574}
+  #bar{position:fixed;right:12px;bottom:10px;opacity:.6}
+  @media (max-width:800px){#wrap{flex-direction:column}#panel{width:auto;border-left:0;border-top:1px solid #1c2230;max-height:40%}}
 </style></head>
 <body>
+<div id="wrap">
+  <iframe id="f" src="live-diagram.html"></iframe>
+  <div id="panel">
+    <h2>Now building</h2><div id="now"></div>
+    <h2 class="later">Recent</h2><div id="log"></div>
+  </div>
+</div>
 <div id="bar">live, reloads every 15 s</div>
-<iframe id="f" src="live-diagram.html"></iframe>
 <script>
+  var COLOR = {done:'#34d399', running:'#22d3ee', waiting:'#94a3b8', blocked:'#fb7185', human:'#fbbf24'};
+  function item(name, state, text, time) {
+    var d = document.createElement('div'); d.className = 'item';
+    d.style.borderColor = COLOR[state] || '#94a3b8';
+    var n = document.createElement('div'); n.className = 'name';
+    n.textContent = name;
+    if (time) { var t = document.createElement('span'); t.className = 'time'; t.textContent = time + '  '; n.prepend(t); }
+    d.appendChild(n);
+    if (text) { var x = document.createElement('div'); x.className = 'text'; x.textContent = text; d.appendChild(x); }
+    return d;
+  }
+  function draw() {
+    var N = window.NOW || {now: [], log: []};
+    var now = document.getElementById('now'), log = document.getElementById('log');
+    now.innerHTML = ''; log.innerHTML = '';
+    if (!N.now.length) now.innerHTML = '<div class="empty">Nothing running.</div>';
+    N.now.forEach(function (e) { now.appendChild(item(e.label, e.state, e.text)); });
+    if (!N.log.length) log.innerHTML = '<div class="empty">No changes yet.</div>';
+    N.log.forEach(function (e) { log.appendChild(item(e.label + ': ' + e.state, e.state, e.text, e.time)); });
+  }
+  function load() {
+    var s = document.createElement('script');
+    s.src = 'now.js?t=' + Date.now();
+    s.onload = function () { draw(); s.remove(); };
+    s.onerror = function () { s.remove(); };
+    document.body.appendChild(s);
+  }
+  load();
   setInterval(function () {
     document.getElementById('f').src = 'live-diagram.html?t=' + Date.now();
+    load();
   }, 15000);
 </script>
 </body></html>
@@ -126,8 +173,9 @@ def render(spec, status, out_dir):
 
     os.makedirs(out_dir, exist_ok=True)
     live = os.path.join(out_dir, "live.html")
-    if not os.path.exists(live):
+    if not os.path.exists(live) or open(live).read() != LIVE_HTML:
         open(live, "w").write(LIVE_HTML)
+    write_panel(spec, status, out_dir)
 
     if not os.path.exists(ARCHIFY):
         die("archify not found. Set ARCHIFY=/path/to/archify/bin/archify.mjs")
@@ -158,6 +206,25 @@ def render(spec, status, out_dir):
     print(f"build-map: {done}/{total} done -> {live}")
     if warn:
         print("build-map: " + warn)
+
+
+def write_panel(spec, status, out_dir):
+    """now.js feeds the "Now building" panel in live.html: every running node
+    with its longest description, and the last changes. A script file rather
+    than JSON, because a page opened from disk may load scripts but not fetch."""
+    states = status.get("nodes", {})
+    label = {n["id"]: n["label"] for n in spec["nodes"]}
+    now = []
+    for n in spec["nodes"]:
+        s = states.get(n["id"], {})
+        if s.get("state") in ("running", "blocked", "human"):
+            now.append({"id": n["id"], "label": n["label"], "state": s["state"],
+                        "text": s.get("say") or s.get("note") or ""})
+    log = [dict(e, label=label.get(e["id"], e["id"]))
+           for e in reversed(status.get("log", []))]
+    data = {"now": now, "log": log, "updated": status.get("updated", "")}
+    with open(os.path.join(out_dir, "now.js"), "w") as f:
+        f.write("window.NOW = " + json.dumps(data, ensure_ascii=False) + ";\n")
 
 
 # ----------------------------------------------------------------------- init
@@ -283,13 +350,36 @@ def main():
         status_path = os.path.join(out_dir, "status.json")
         status = load_status(status_path)
         status.setdefault("nodes", {})
-        for item in argv[2:]:
+        items, says = [], {}
+        rest_args = argv[2:]
+        k = 0
+        while k < len(rest_args):
+            if rest_args[k] == "--say":
+                if k + 1 >= len(rest_args) or ":" not in rest_args[k + 1]:
+                    die('--say wants "<id>: <what the agent is doing>"')
+                i, _, text = rest_args[k + 1].partition(":")
+                says[i.strip()] = text.strip()
+                k += 2
+            else:
+                items.append(rest_args[k]); k += 1
+        now = time.strftime("%H:%M")
+        log = status.setdefault("log", [])
+        for item in items:
             i, _, rest = item.partition("=")
             state, _, note = rest.partition(":")
             if state not in STATE_TYPE:
                 die(f"{i}: unknown state '{state}' (use {', '.join(STATE_TYPE)})")
             status["nodes"][i] = {"state": state, "note": note}
-        status["updated"] = time.strftime("%H:%M")
+            if i in says:
+                status["nodes"][i]["say"] = says.pop(i)
+            log.append({"time": now, "id": i, "state": state,
+                        "text": status["nodes"][i].get("say") or note})
+        for i, text in says.items():   # --say alone: new description, same state
+            if i not in status["nodes"]:
+                die(f"--say names {i}, which has no state yet")
+            status["nodes"][i]["say"] = text
+        del log[:-6]                   # the panel shows the last six changes
+        status["updated"] = now
         json.dump(status, open(status_path, "w"), indent=2, ensure_ascii=False)
         render(json.load(open(map_path)), status, out_dir)
         return
