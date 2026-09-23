@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Live build map: watch any build as a picture that colours itself.
+
+  build-map init <dir> --title "<title>" --node "<id>:<label>[:<sublabel>]" ...
+                       [--after "<id>:<dep>,<dep>"] ...
+      Generates <dir>/map.json from the nodes and their dependencies. Columns
+      come from dependency depth, lanes from the nodes that share a column.
+      Use this when the plan has no docs/build-map.json. Safe to re-run; it
+      overwrites map.json and keeps any status.
+
+  build-map set <dir> <id>=<state>[:<note>] ...
+      Sets those nodes' states, stamps the time, and re-renders. One command,
+      so the picture can never drift from the board. States: waiting, running,
+      done, blocked, human. Unlisted nodes stay as they are (waiting at first).
+
+  build-map <map.json> <status.json> <dir>
+      The explicit form: render that map with that status into that directory,
+      and write <dir>/map.json, so that "set" updates the same picture. Use
+      this when the plan carries docs/build-map.json. Pass <dir>/status.json
+      as <status.json>, because that is the file "set" writes.
+
+Every form writes <dir>/live-diagram.html and, once, <dir>/live.html. Open
+live.html in Chrome: it reloads itself every 15 s.
+
+Every render warns, on stdout and as the picture's subtitle, when more nodes are
+waiting than running, and names the waiting ones: work that could run is sitting.
+"""
+import json, os, subprocess, sys, tempfile, time
+
+ARCHIFY = os.path.expanduser(os.environ.get(
+    "ARCHIFY", "~/.claude/skills/archify/bin/archify.mjs"))
+
+# archify colours nodes by component type; the legend labels say what each
+# colour means here, so the mapping stays truthful to the reader.
+# "human" marks a node that is waiting on a person, not on an agent.
+STATE_TYPE = {"done": "backend", "running": "frontend", "waiting": "external",
+              "blocked": "security", "human": "cloud"}
+LEGEND = {"backend": "Done", "frontend": "Building now", "external": "Waiting",
+          "security": "Blocked or failing", "cloud": "Needs you"}
+MAX_COL = 5          # archify workflow columns are 0..5
+MAX_LANES = 5        # more lanes than this does not fit a laptop screen
+
+LIVE_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Build map (live)</title>
+<style>
+  html,body{margin:0;height:100%;background:#05070d;color:#9aa4b2;font:12px ui-monospace,Menlo,monospace}
+  #bar{position:fixed;right:12px;bottom:10px;z-index:2;opacity:.8}
+  iframe{border:0;width:100%;height:100%;display:block}
+</style></head>
+<body>
+<div id="bar">live, reloads every 15 s</div>
+<iframe id="f" src="live-diagram.html"></iframe>
+<script>
+  setInterval(function () {
+    document.getElementById('f').src = 'live-diagram.html?t=' + Date.now();
+  }, 15000);
+</script>
+</body></html>
+"""
+
+
+def die(msg, code=1):
+    print("build-map: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------ rendering
+def render(spec, status, out_dir):
+    states = status.get("nodes", {})
+    ids = {n["id"] for n in spec["nodes"]}
+    unknown = sorted(set(states) - ids)
+    if unknown:
+        die("status names nodes the map does not have: " + ", ".join(unknown))
+
+    done = 0
+    for n in spec["nodes"]:
+        s = states.get(n["id"], {})
+        state = s.get("state", "waiting")
+        if state not in STATE_TYPE:
+            die(f"node {n['id']}: unknown state '{state}' (use {', '.join(STATE_TYPE)})")
+        done += state == "done"
+        n["type"] = STATE_TYPE[state]
+        note = (s.get("note") or "").strip()
+        # The node's colour already says the state; the line under the name
+        # carries the note when there is one (workflow nodes do not draw tags).
+        if note:
+            n["sublabel"] = note[:26]
+
+    # Idle warning, from the rule that nothing ready should sit there. More nodes
+    # waiting than running means the graph is holding work back, so name them.
+    waiting = [n["id"] for n in spec["nodes"]
+               if states.get(n["id"], {}).get("state", "waiting") == "waiting"]
+    running = [n["id"] for n in spec["nodes"]
+               if states.get(n["id"], {}).get("state") == "running"]
+    warn = ""
+    if len(waiting) > len(running):
+        shown = ", ".join(waiting[:8]) + (", ..." if len(waiting) > 8 else "")
+        warn = (f"{len(waiting)} waiting, {len(running)} running: "
+                f"check for false arrows ({shown})")
+
+    total = len(spec["nodes"])
+    base_title = spec["meta"]["title"].split(" · ")[0]
+    stamp = status.get("updated", "")
+    spec["meta"]["title"] = f"{base_title} · {done} of {total} done" + (f" · updated {stamp}" if stamp else "")
+    if warn:
+        spec["meta"]["subtitle"] = warn
+    else:
+        spec["meta"].pop("subtitle", None)
+    spec["meta"]["legend"] = {"mode": "auto",
+                              "entries": {k: {"label": v} for k, v in LEGEND.items()}}
+    spec["meta"].pop("output", None)
+
+    os.makedirs(out_dir, exist_ok=True)
+    live = os.path.join(out_dir, "live.html")
+    if not os.path.exists(live):
+        open(live, "w").write(LIVE_HTML)
+
+    out = os.path.join(out_dir, "live-diagram.html")
+    for attempt in (1, 2):
+        with tempfile.NamedTemporaryFile("w", suffix=".workflow.json", dir=out_dir, delete=False) as tmp:
+            json.dump(spec, tmp, indent=2, ensure_ascii=False)
+        try:
+            r = subprocess.run(["node", ARCHIFY, "deliver", "workflow", tmp.name, out, "--json"],
+                               capture_output=True, text=True)
+        finally:
+            os.unlink(tmp.name)
+        if r.returncode == 0:
+            break
+        detail = r.stdout.strip() or r.stderr.strip()
+        # archify reports the smallest viewBox its layout needs; take it and
+        # retry once, keeping the width wide so the picture stays short enough
+        # for a laptop screen.
+        need = None
+        try:
+            need = json.loads(detail)["diagnostics"][0]["evidence"]["requiredViewBox"]
+        except Exception:
+            pass
+        if attempt == 1 and need:
+            spec["meta"]["viewBox"] = [max(1240, need[0]), need[1]]
+            continue
+        die("archify deliver failed; the previous map stays in place.\n" + detail[:1200])
+    print(f"build-map: {done}/{total} done -> {live}")
+    if warn:
+        print("build-map: " + warn)
+
+
+# ----------------------------------------------------------------------- init
+def build_spec(title, nodes, after):
+    """nodes: [(id, label, sublabel)]; after: {id: [dep, ...]}. Columns come
+    from dependency depth, lanes from the nodes sharing a column."""
+    ids = [n[0] for n in nodes]
+    depth = {}
+
+    def d(i, seen=()):
+        if i in depth:
+            return depth[i]
+        if i in seen:
+            die(f"nodes depend on each other in a circle: {' -> '.join(seen + (i,))}")
+        deps = [x for x in after.get(i, []) if x in ids]
+        depth[i] = min(MAX_COL, max((d(x, seen + (i,)) + 1 for x in deps), default=0))
+        return depth[i]
+
+    for i in ids:
+        d(i)
+
+    by_col = {}
+    for i in ids:
+        by_col.setdefault(depth[i], []).append(i)
+    lanes_needed = min(MAX_LANES, max(len(v) for v in by_col.values()))
+    lane_of = {}
+    for col, members in by_col.items():
+        for k, i in enumerate(members):
+            lane_of[i] = min(k, lanes_needed - 1)
+
+    lanes = [{"id": f"lane{k}", "label": "Main" if k == 0 else f"Parallel {k}"}
+             for k in range(lanes_needed)]
+    spec_nodes = []
+    for i, label, sub in nodes:
+        n = {"id": i, "lane": f"lane{lane_of[i]}", "col": depth[i], "type": "external",
+             "label": label[:22], "width": 132}
+        if sub:
+            n["sublabel"] = sub[:26]
+        spec_nodes.append(n)
+    edges = [{"id": f"{dep}-{i}", "from": dep, "to": i}
+             for i in ids for dep in after.get(i, []) if dep in ids]
+
+    # mainPath must be a chain of real edges: take the longest one (the
+    # critical path), so archify draws it as the spine of the picture.
+    best = {}
+
+    def longest(i):
+        if i not in best:
+            deps = [x for x in after.get(i, []) if x in ids]
+            best[i] = max((longest(x) for x in deps), key=len, default=[]) + [i]
+        return best[i]
+
+    main = max((longest(i) for i in ids), key=len)
+    spec = {"schema_version": 2, "diagram_type": "workflow",
+            "meta": {"title": title, "quality_profile": "showcase", "locale": "en",
+                     "viewBox": [1240, max(360, 140 * lanes_needed)]},
+            "lanes": lanes, "nodes": spec_nodes, "edges": edges}
+    if len(main) >= 2:
+        spec["mainPath"] = main
+    return spec
+
+
+def parse_init(argv):
+    title, nodes, after = "Build", [], {}
+    k = 0
+    while k < len(argv):
+        a = argv[k]
+        if a == "--title":
+            title = argv[k + 1]; k += 2
+        elif a == "--node":
+            parts = argv[k + 1].split(":")
+            if len(parts) < 2:
+                die('--node wants "<id>:<label>[:<sublabel>]"')
+            nodes.append((parts[0], parts[1], parts[2] if len(parts) > 2 else ""))
+            k += 2
+        elif a == "--after":
+            i, _, deps = argv[k + 1].partition(":")
+            after[i] = [x for x in deps.split(",") if x]
+            k += 2
+        else:
+            die(f"unknown argument {a}")
+    if not nodes:
+        die("init wants at least one --node")
+    return title, nodes, after
+
+
+def load_status(path):
+    try:
+        return json.load(open(path))
+    except FileNotFoundError:
+        return {"nodes": {}}
+    except Exception as e:
+        die(f"cannot read {path}: {e}")
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        print(__doc__.strip()); sys.exit(2)
+
+    if argv[0] == "init":
+        if len(argv) < 2:
+            die("init wants a directory")
+        out_dir = os.path.expanduser(argv[1])
+        title, nodes, after = parse_init(argv[2:])
+        spec = build_spec(title, nodes, after)
+        os.makedirs(out_dir, exist_ok=True)
+        # Render a copy first: render() may enlarge the viewBox to whatever the
+        # layout needs, and that size is worth keeping so later updates render once.
+        draft = json.loads(json.dumps(spec))
+        render(draft, load_status(os.path.join(out_dir, "status.json")), out_dir)
+        spec["meta"]["viewBox"] = draft["meta"]["viewBox"]
+        json.dump(spec, open(os.path.join(out_dir, "map.json"), "w"), indent=2, ensure_ascii=False)
+        return
+
+    if argv[0] == "set":
+        if len(argv) < 3:
+            die('set wants a directory and at least one "<id>=<state>[:<note>]"')
+        out_dir = os.path.expanduser(argv[1])
+        map_path = os.path.join(out_dir, "map.json")
+        if not os.path.exists(map_path):
+            die(f"no map.json in {out_dir}; run build-map init, or the explicit form, first")
+        status_path = os.path.join(out_dir, "status.json")
+        status = load_status(status_path)
+        status.setdefault("nodes", {})
+        for item in argv[2:]:
+            i, _, rest = item.partition("=")
+            state, _, note = rest.partition(":")
+            if state not in STATE_TYPE:
+                die(f"{i}: unknown state '{state}' (use {', '.join(STATE_TYPE)})")
+            status["nodes"][i] = {"state": state, "note": note}
+        status["updated"] = time.strftime("%H:%M")
+        json.dump(status, open(status_path, "w"), indent=2, ensure_ascii=False)
+        render(json.load(open(map_path)), status, out_dir)
+        return
+
+    if len(argv) != 3:
+        print(__doc__.strip()); sys.exit(2)
+    map_path, status_path, out_dir = (os.path.expanduser(a) for a in argv)
+    try:
+        spec = json.load(open(map_path))
+    except Exception as e:
+        die(f"cannot read {map_path}: {e}")
+    os.makedirs(out_dir, exist_ok=True)
+    # Render a copy, then keep the map as <dir>/map.json, so that "set" has the
+    # map it reads and later updates render once at the size the layout needed.
+    draft = json.loads(json.dumps(spec))
+    render(draft, load_status(status_path), out_dir)
+    if "viewBox" in draft.get("meta", {}):
+        spec.setdefault("meta", {})["viewBox"] = draft["meta"]["viewBox"]
+    json.dump(spec, open(os.path.join(out_dir, "map.json"), "w"), indent=2, ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    main()
